@@ -1,0 +1,1428 @@
+---
+title: "Post-seeding assembly processes shape seed banks more than initial restoration design"
+date: "2026-06-22"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  dpi = 96
+)
+# Note: set error = TRUE above if you want knitting to continue past a failing chunk.
+```
+
+## install packages
+
+```{r install-packages-0}
+# install.packages("here")        # Run this once in the console
+# install.packages("lmerTest")
+# install.packages("ggeffects")
+# install.packages("tidyverse")
+# install.packages("emmeans")
+# install.packages("multcomp")
+# install.packages("multcompView")
+# install.packages("devtools")
+# install.packages("vegan")
+# install.packages("ggplot2")
+# install.packages("ggordiplots")
+# install.packages("ggpubr")
+# install.packages("tidytext")
+```
+
+## load libraries
+
+```{r load-libraries-1}
+library(here)
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(multcomp)
+library(multcompView)
+library(vegan)
+library(ggordiplots)
+library(ggpubr)
+library(ggplot2)
+library(car)
+# pak::pak("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+library(pairwiseAdonis)
+
+# Set global font to Arial
+theme_set(theme_gray(base_family = "Arial"))
+```
+
+## global settings and helper functions
+
+```{r global-settings-and-helper-functions-2}
+# Global factor levels
+trt_levels <- c("R", "DT", "FD", "IR")
+trt_labels <- c("Random", "Drought Tolerant", "Functionally Diverse", "Invasion Resistant")
+# two-word labels wrapped onto two lines (second word below first) for narrow panels
+trt_labels_wrap <- c("Random", "Drought\nTolerant", "Functionally\nDiverse", "Invasion\nResistant")
+water_levels <- c("125", "50")
+water_labels <- c("Precipitation Addition", "Precipitation Reduction")
+
+# Shared themes
+theme_custom <- function() {
+  theme_minimal(base_family = "Arial") +
+    theme(
+      axis.text.x = element_text(size = 16, family = "Arial"),
+      axis.text.y = element_text(size = 16, family = "Arial"),
+      axis.title.x = element_text(size = 18, face = "bold", family = "Arial"),
+      axis.title.y = element_text(size = 18, face = "bold", family = "Arial"),
+      plot.title = element_text(face = "bold", size = 20, hjust = 0.5, family = "Arial"),
+      legend.text = element_text(size = 14, family = "Arial"),
+      legend.title = element_text(size = 16, face = "bold", family = "Arial"),
+      legend.position = "bottom",
+      legend.key.size = unit(1, "cm")
+    )
+}
+
+theme_nmds <- function() {
+  theme_minimal(base_family = "Arial") +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16, family = "Arial"),
+      axis.title = element_text(face = "bold", size = 14, family = "Arial"),
+      axis.text = element_text(size = 13, family = "Arial"),
+      legend.title = element_text(face = "bold", size = 14, family = "Arial"),
+      legend.text = element_text(size = 13, family = "Arial"),
+      legend.position = "right",
+      panel.border = element_rect(linewidth = 1.5, fill = NA)
+    )
+}
+
+# apply standard factor levels:
+apply_factors <- function(df, trt_col = "treatment", water_col = "water") {
+  if (!is.null(trt_col) && trt_col %in% names(df)) {
+    df[[trt_col]] <- factor(toupper(df[[trt_col]]), levels = trt_levels)
+  }
+  if (!is.null(water_col) && water_col %in% names(df)) {
+    df[[water_col]] <- factor(df[[water_col]], levels = water_levels)
+  }
+  df
+}
+# helper: calculate whisker positions for letter placement
+calc_whisker_positions <- function(data, y_var, group_vars) {
+  data %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      Q3 = quantile(.data[[y_var]], 0.75, na.rm = TRUE),
+      Q1 = quantile(.data[[y_var]], 0.25, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      upper_whisker = min(max(.data[[y_var]], na.rm = TRUE), Q3 + 1.5 * IQR),
+      .groups = "drop"
+    ) %>%
+    mutate(yposition = upper_whisker + 0.05)
+}
+# helper: Clean and sort matrix row names
+clean_sort_matrix <- function(matrix_obj) {
+  rownames(matrix_obj) <- gsub("-", " ", rownames(matrix_obj))
+  rownames(matrix_obj) <- tolower(rownames(matrix_obj))
+  rownames(matrix_obj) <- gsub("([0-9]+) (\\w+)", "\\2 \\1", rownames(matrix_obj))
+  
+  row_parts <- strsplit(rownames(matrix_obj), " ")
+  row_sort_key <- data.frame(
+    alpha = sapply(row_parts, `[`, 1),
+    num = as.numeric(sapply(row_parts, `[`, 2))
+  )
+  sorted_rows <- order(row_sort_key$alpha, row_sort_key$num)
+  matrix_obj[sorted_rows, ]
+}
+
+# helper: get CLD letters for mixed models
+get_cld_letters <- function(model_obj, data_df, y_var) {
+  emm <- emmeans(model_obj, ~ treatment * type * water)
+  cld_df <- cld(emm, Letters = letters, reversed = TRUE, alpha = 0.05)
+  cld_df$Letters <- trimws(cld_df$.group)
+  cld_df <- cld_df %>% mutate(treatment = factor(treatment, levels = trt_levels))
+  
+  data_df %>%
+    filter(!is.na(water), !is.na(type), !is.na(treatment)) %>%
+    group_by(treatment, type, water) %>%
+    summarise(
+      Q3 = quantile(.data[[y_var]], 0.75, na.rm = TRUE),
+      Q1 = quantile(.data[[y_var]], 0.25, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      upper_whisker = min(max(.data[[y_var]], na.rm = TRUE), Q3 + 1.5 * IQR),
+      .groups = "drop"
+    ) %>%
+    mutate(yposition = upper_whisker + 0.05) %>%
+    left_join(cld_df, by = c("treatment", "type", "water"))
+}
+```
+
+## load and prepare data
+
+```{r load-and-prepare-data}
+plot_metadata <- read.csv(here("plot_metadata.csv"))
+species_counts <- read.csv(here("species_counts.csv"))
+# View(plot_metadata)
+# View(species_counts)
+
+# unpack univariate tracking metrics
+native   <- plot_metadata %>% dplyr::select(plot, treatment, water, structure, total_native)
+invasive <- plot_metadata %>% dplyr::select(plot, treatment, water, structure, total_invasive)
+native.rev <- plot_metadata %>% dplyr::select(plot, treatment, water, structure)
+
+# reconstruct metadata lookup mapping for environmental factors
+water.levels <- plot_metadata %>%
+  dplyr::select(plot, treatment, water) %>%
+  mutate(match_id = paste0(tolower(treatment), " ", plot)) %>%
+  distinct()
+rownames(water.levels) <- water.levels$match_id
+
+abvg_water <- plot_metadata %>% dplyr::select(plot, treatment, water, structure)
+
+# unpack Species Trait Matrix
+seed_data <- species_counts %>%
+  distinct(species_code, seed.mass, mean_abundance) %>%
+  rename(code = species_code) %>%
+  filter(!is.na(code))
+
+# pivot long matrices back to wide structures for Vegan/NMDS steps
+year0 <- species_counts %>%
+  filter(sample_type == "year0") %>%
+  dplyr::select(sample_id, species_code, abundance) %>%
+  pivot_wider(names_from = species_code, values_from = abundance, values_fill = 0) %>%
+  as.data.frame()
+colnames(year0)[1] <- "X"
+
+native_mat.rev <- species_counts %>%
+  filter(sample_type == "year4_below") %>%
+  dplyr::select(sample_id, species_code, abundance) %>%
+  pivot_wider(names_from = species_code, values_from = abundance, values_fill = 0) %>%
+  as.data.frame()
+colnames(native_mat.rev)[1] <- "X"
+
+abvg_4 <- species_counts %>%
+  filter(sample_type == "year4_above") %>%
+  dplyr::select(sample_id, species_code, abundance) %>%
+  pivot_wider(names_from = species_code, values_from = abundance, values_fill = 0) %>%
+  as.data.frame()
+colnames(abvg_4)[1] <- "X"
+
+# convert layout indices to factor designations
+for (df_name in c("native", "invasive")) {
+  df <- get(df_name)
+  df$plot <- as.factor(df$plot)
+  df$treatment <- as.factor(df$treatment)
+  df$water <- as.factor(df$water)
+  df$structure <- as.factor(df$structure)
+  assign(df_name, df)
+}
+```
+
+## analysis 1: native vs invasive counts
+
+```{r analysis-1-native-vs-invasive-counts-4}
+native <- apply_factors(native)
+invasive <- apply_factors(invasive)
+
+combined_df <- full_join(native, invasive, by = c("plot", "treatment", "water", "structure"))
+combined_new <- combined_df[-27, ] #outlier removed
+
+long_new <- combined_new %>%
+  pivot_longer(cols = c(total_native, total_invasive), names_to = "type", values_to = "counts") %>%
+  apply_factors()
+
+# native glmer.nb 
+native_model <- glmer.nb(total_native ~ treatment * water + (1|structure), data = native, family = poisson)
+summary(native_model)
+Anova(native_model) #type II chi-sq test
+
+combined_model_nb <- glmer.nb(total_invasive ~ treatment * water + (1|structure), data = combined_new)
+summary(combined_model_nb)
+#anova(combined_model_nb)
+Anova(combined_model_nb) #type II chi-sq
+
+# post-hoc: emmeans on the actual GLMER models (type = "response" back-transforms to count scale)
+emm_native   <- emmeans(native_model,      ~ treatment * water, type = "response")
+emm_invasive <- emmeans(combined_model_nb, ~ treatment * water, type = "response")
+# no significant interactions but using for CLD on ggplot
+
+cld_native <- as.data.frame(cld(emm_native,   Letters = letters, reversed = TRUE, alpha = 0.05)) %>%
+  mutate(type = "total_native",   Letters = trimws(.group))
+cld_invasive <- as.data.frame(cld(emm_invasive, Letters = letters, reversed = TRUE, alpha = 0.05)) %>%
+  mutate(type = "total_invasive", Letters = trimws(.group))
+
+letters_df <- bind_rows(
+  cld_native   %>% dplyr::select(treatment, water, type, Letters),
+  cld_invasive %>% dplyr::select(treatment, water, type, Letters)
+) %>%
+  mutate(
+    treatment = factor(toupper(as.character(treatment)), levels = trt_levels),
+    water     = factor(as.character(water), levels = water_levels)
+  )
+
+plot_data <- long_new %>%
+  calc_whisker_positions("counts", c("treatment", "water", "type")) %>%
+  mutate(label_y = upper_whisker + 5) %>%
+  left_join(letters_df, by = c("treatment", "water", "type"))
+```
+
+### Figure 1, count data
+
+```{r ggplot1-count-data-5}
+counts_boxplot <- ggplot(long_new, aes(x = treatment, y = counts, fill = interaction(water, type))) +
+  geom_boxplot(position = position_dodge(width = 0.9), outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "darkred",
+               position = position_dodge(width = 0.9), aes(group = interaction(water, type))) +
+  geom_text(data = plot_data,
+            aes(x = treatment, y = label_y, label = Letters, group = interaction(water, type)),
+            position = position_dodge(width = 0.9), vjust = 0, size = 7.5, show.legend = FALSE, family = "Arial") +
+  scale_x_discrete(labels = trt_labels) +
+  scale_y_continuous(labels = function(x) x / 0.01) +
+  scale_fill_viridis_d(
+    option = "viridis", begin = 0.2, end = 0.9, name = "",
+    labels = c("125.total_invasive" = "Invasive (Precipitation Addition)",
+               "50.total_invasive" = "Invasive (Precipitation Reduction)",
+               "125.total_native" = "Native (Precipitation Addition)",
+               "50.total_native" = "Native (Precipitation Reduction)")
+  ) +
+  labs(x = NULL, y = expression(bold("Seed Count (per m"^2*")"))) +
+  theme_custom() +
+  theme(
+    panel.grid       = element_blank(),                                  # remove background grid
+    axis.line        = element_line(colour = "black", linewidth = 0.8),  # solid axis lines
+    axis.ticks       = element_line(colour = "black", linewidth = 0.8),
+    legend.text      = element_text(size = 20, family = "Arial"),
+    legend.title     = element_text(size = 20, family = "Arial"),
+    legend.key.size  = unit(1.2, "cm"),
+    axis.title.y     = element_text(size = 20, face = "bold", family = "Arial"),
+    axis.title.x     = element_text(size = 16, face = "bold", family = "Arial"),
+    axis.text.x      = element_text(size = 20, family = "Arial"),
+    axis.text.y      = element_text(size = 20, family = "Arial")
+  ) +
+  # stack the 4 legend entries into a 2-row x 2-column block at the bottom
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+print(counts_boxplot)
+ggsave("Figure_1.png", plot = counts_boxplot, width = 16, height = 8, dpi = 1200, units = "in", bg = "white")
+```
+
+## analysis 2: shannon diversity
+
+```{r analysis-2-shannon-diversity-6}
+# matrix prep
+plotnames <- native_mat.rev[, 1]
+native_mat.rev2 <- native_mat.rev[, -1]
+rownames(native_mat.rev2) <- plotnames
+native.rev <- native.rev[-75, ]    ## outlier
+
+# Calculate diversity
+shannon_native2 <- diversity(native_mat.rev2, index = "shannon")
+native.rev$shannon_native2 <- shannon_native2
+
+# Apply factors
+native.rev$treatment <- factor(toupper(native.rev$treatment), levels = trt_levels)
+native.rev$water <- factor(native.rev$water, levels = water_levels)
+
+# Statistical analysis
+native_div.model <- lmer(shannon_native2 ~ treatment * water + (1|structure), data = native.rev)
+summary(native_div.model)
+anova(native_div.model)
+
+# Generate estimated marginal means and CLD
+emm_div <- emmeans(native_div.model, ~ treatment * water)
+summary(emm_div)
+cld_div <- cld(emm_div, Letters = letters, reversed = TRUE, alpha = 0.05)
+
+# Clean CLD data frame
+cld_div <- as.data.frame(cld_div) %>%
+  mutate(
+    Letters = trimws(.group),
+    treatment = factor(treatment, levels = trt_levels),
+    water = factor(water, levels = water_levels)
+  )
+
+# Calculate whisker positions
+letters_df_div <- native.rev %>%
+  group_by(treatment, water) %>%
+  summarise(
+    Q3 = quantile(shannon_native2, 0.75, na.rm = TRUE),
+    Q1 = quantile(shannon_native2, 0.25, na.rm = TRUE),
+    IQR = Q3 - Q1,
+    upper_whisker = min(max(shannon_native2, na.rm = TRUE), Q3 + 1.5 * IQR),
+    .groups = "drop"
+  ) %>%
+  left_join(cld_div, by = c("treatment", "water")) %>%
+  mutate(yposition = upper_whisker + 0.05)
+
+# Plot
+shannon_boxplot <- ggplot(native.rev, aes(x = treatment, y = shannon_native2, fill = water)) +
+  geom_boxplot(position = position_dodge(width = 0.75), outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, 
+               position = position_dodge(width = 0.75), color = "darkred",
+               aes(group = water)) +
+  geom_text(data = letters_df_div,
+            aes(x = treatment, y = yposition, label = Letters, group = water), 
+            position = position_dodge(width = 0.75),
+            vjust = 0, size = 6.5) + 
+  scale_x_discrete(labels = trt_labels_wrap) +
+  scale_y_continuous(expand = expansion(mult = c(0.07, 0.15))) +
+  scale_fill_viridis_d(
+    option = "viridis",
+    begin = 0.2,
+    end = 0.6,
+    name = "",
+    labels = water_labels
+  ) +
+  labs(x = NULL, y = "Native Shannon Diversity") +
+  theme_custom() +
+  theme(
+    panel.grid      = element_blank(),                                  # remove background grid
+    axis.line       = element_line(colour = "black", linewidth = 0.8),  # solid axis lines
+    axis.ticks      = element_line(colour = "black", linewidth = 0.8),
+    axis.title.y    = element_text(size = 20, face = "bold", family = "Arial"),
+    axis.title.x    = element_text(size = 20, face = "bold", family = "Arial"),
+    axis.text.x     = element_text(size = 20, family = "Arial"),
+    axis.text.y     = element_text(size = 20, family = "Arial"),
+    legend.text     = element_text(size = 20, family = "Arial"),
+    legend.title    = element_text(size = 20, family = "Arial"),
+    legend.key.size = unit(1.2, "cm")
+  )
+# shannon_boxplot is combined with richness_boxplot in the Figure 2 chunk below
+```
+
+## analysis 3: native species richness
+
+```{r analysis-3-native-species-richness-7}
+# 1. filter out the columns
+native_mat.rev6 <- native_mat.rev[, !colnames(native_mat.rev) %in% c("LUAL", "MASA", "PEHE", "SACO")]
+
+# 2. drop the first column
+native_mat.rev7 <- native_mat.rev6[, -1]
+rownames(native_mat.rev7) <- native_mat.rev6[, 1]
+native_mat.rev.4 <- clean_sort_matrix(native_mat.rev7)
+
+native_richness <- specnumber(native_mat.rev.4)
+native.rev$richness <- native_richness
+native.rev <- apply_factors(native.rev)
+
+richness_model <- lmer(richness ~ treatment * water + (1|structure), data = native.rev)
+summary(richness_model)
+anova(richness_model)
+
+emm_richness <- emmeans(richness_model, ~ treatment * water)
+print(emm_richness)
+cld_richness <- cld(emm_richness, Letters = letters, reversed = TRUE, alpha = 0.05)
+
+cld_richness <- as.data.frame(cld_richness) %>%
+  mutate(
+    Letters = trimws(.group),
+    treatment = factor(treatment, levels = trt_levels),
+    water = factor(water, levels = water_levels)
+  )
+plot_letters_rich <- native.rev %>%
+  calc_whisker_positions("richness", c("treatment", "water")) %>%
+  left_join(cld_richness, by = c("treatment", "water"))
+```
+
+## Figure 2, richness panel
+
+```{r ggplot3-richness-boxplot-8}
+richness_boxplot <- ggplot(native.rev, aes(x = treatment, y = richness, fill = water)) +
+  geom_boxplot(position = position_dodge(width = 0.75), outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, 
+               color = "darkred", position = position_dodge(width = 0.75),
+               aes(group = water)) +
+  geom_text(data = plot_letters_rich, 
+            aes(x = treatment, y = yposition, label = Letters, group = water), 
+            position = position_dodge(width = 0.75),  
+            vjust = 0, size = 6.5) + 
+  scale_x_discrete(labels = trt_labels_wrap) +
+  scale_y_continuous(expand = expansion(mult = c(0.07, 0.1))) +
+  scale_fill_viridis_d(
+    option = "viridis",
+    begin = 0.2,
+    end = 0.6,
+    name = "",
+    labels = water_labels
+  ) +
+  labs(x = NULL, y = "Native Species Richness") +
+  theme_custom() +
+  theme(
+    panel.grid      = element_blank(),                                  # remove background grid
+    axis.line       = element_line(colour = "black", linewidth = 0.8),  # solid axis lines
+    axis.ticks      = element_line(colour = "black", linewidth = 0.8),
+    axis.title.y    = element_text(size = 20, face = "bold", family = "Arial"),
+    axis.title.x    = element_text(size = 20, face = "bold", family = "Arial"),
+    axis.text.x     = element_text(size = 20, family = "Arial"),
+    axis.text.y     = element_text(size = 20, family = "Arial"),
+    legend.text     = element_text(size = 20, family = "Arial"),
+    legend.title    = element_text(size = 20, family = "Arial"),
+    legend.key.size = unit(1.2, "cm")
+  )
+# richness_boxplot is combined with shannon_boxplot in the Figure 2 chunk below
+```
+
+## Figure 2: Shannon diversity & richness (combined)
+
+```{r figure-2-shannon-richness-combined}
+# Panel A = native Shannon diversity, Panel B = native species richness.
+# Both panels share the same precipitation legend, so it is drawn once at the bottom.
+figure_2 <- ggarrange(
+  shannon_boxplot, richness_boxplot,
+  labels        = c("A", "B"),
+  ncol          = 1, nrow = 2,
+  common.legend = TRUE,
+  legend        = "bottom",
+  font.label    = list(size = 22, face = "bold", family = "Arial")
+)
+print(figure_2)
+ggsave("Figure_2.png", plot = figure_2, width = 10, height = 12, dpi = 1200, units = "in", bg = "white")
+```
+
+## analysis4: Pielou's J
+
+```{r analysis4-pielou-s-j-9}
+richness_vals <- specnumber(native_mat.rev.4)
+shannon_vals <- diversity(native_mat.rev.4, index = "shannon")
+
+J <- shannon_vals / log(richness_vals)
+
+pielou_data <- data.frame(
+  Sample = names(J),
+  Evenness = as.numeric(J),
+  stringsAsFactors = FALSE
+) %>%
+  separate(col = Sample, into = c("treatment", "plot"), sep = " ", remove = FALSE, convert = FALSE, fill = "right") %>%
+  filter(!is.na(Evenness), !is.infinite(Evenness)) %>%
+  mutate(
+    treatment = toupper(treatment),
+    treatment = factor(treatment, levels = trt_levels),
+    plot = as.numeric(plot)
+  )
+
+print(head(pielou_data))
+print(paste("Number of observations:", nrow(pielou_data)))
+
+anova_pielou <- aov(Evenness ~ treatment, data = pielou_data)
+tukey_pielou <- TukeyHSD(anova_pielou)
+```
+
+### ggplot4: pielou_boxplot
+
+```{r ggplot4-pielou-boxplot-10}
+  pielou_boxplot <- ggplot(pielou_data, aes(x = treatment, y = Evenness, fill = treatment)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.5, size = 2) +
+  scale_x_discrete(labels = trt_labels) +
+  scale_fill_viridis_d(option = "viridis", begin = 0.2, end = 0.9) +
+  scale_y_continuous(limits = c(0, 1.1), expand = expansion(mult = c(0.05, 0.05))) +
+  labs(x = "Seed Mixes", y = "Evenness (J')", title = "Pielou's Evenness by Treatment") +
+  theme_custom() +
+  theme(legend.position = "none")
+
+print(pielou_boxplot)
+ggsave("pielous.j.png", plot = pielou_boxplot,width = 10, height = 6, dpi = 1200, units = "in", bg = "white" )
+cat("\n=== PIELOU'S EVENNESS ANOVA ===\n")
+print(summary(anova_pielou))
+
+cat("\n=== TUKEY HSD POST-HOC TEST ===\n")
+print(tukey_pielou)
+```
+
+## analysis 5: NMDS year 0
+
+```{r analysis-5-nmds-year-0-11}
+plotnames <- year0[, 1]
+year0_clean <- year0 %>% dplyr::select(-1)
+rownames(year0_clean) <- plotnames
+
+rows_to_remove <- c(
+  "dt 1", "dt 10", "dt 2", "dt 22", "dt 23", "dt 24", "dt 25", "dt 26", "dt 27", "dt 28", "dt 3", "dt 40",
+  "dt 41", "dt 42", "dt 45", "dt 46", "dt 47", "dt 49", "dt 50", "dt 51", "dt 52", "dt 53", "dt 7", "dt 8", "dt 9",
+  "fd 1", "fd 10", "fd 11", "fd 12", "fd 2", "fd 22", "fd 23", "fd 24", "fd 25", "fd 26", "fd 27", "fd 28", "fd 29",
+  "fd 3", "fd 36", "fd 4", "fd 40", "fd 41", "fd 42", "fd 45", "fd 46", "fd 47", "fd 49", "fd 50", "fd 51", "fd 52",
+  "fd 53", "fd 8", "fd 9", "ir 1", "ir 10", "ir 2", "ir 22", "ir 23", "ir 24", "ir 25", "ir 26", "ir 27", "ir 28",
+  "ir 29", "ir 3", "ir 36", "ir 40", "ir 41", "ir 42", "ir 43", "ir 45", "ir 46", "ir 47", "ir 50", "ir 51", "ir 52",
+  "ir 53", "ir 8", "ir 9", "r 1", "r 10", "r 11", "r 2", "r 22", "r 23", "r 24", "r 25", "r 26", "r 27", "r 28",
+  "r 29", "r 3", "r 32", "r 4", "r 40", "r 41", "r 42", "r 43", "r 45", "r 46", "r 47", "r 50", "r 51", "r 52",
+  "r 53", "r 8", "r 9", "dt 35"
+)
+
+year0_sorted <- year0_clean[!rownames(year0_clean) %in% rows_to_remove, ] %>%
+  {.[order(sapply(strsplit(rownames(.), " "), `[`, 1),
+           as.numeric(sapply(strsplit(rownames(.), " "), `[`, 2))), ]}
+
+native.rel.rev <- decostand(native_mat.rev.4, method = "total")
+year_4 <- native.rel.rev[, 1:32]
+common_cols <- intersect(colnames(year_4), colnames(year0_sorted))
+year_0 <- year0_sorted[, common_cols]
+year_0[is.na(year_0)] <- 0
+
+year_0bc <- vegdist(as.matrix(year_0), method = "bray")
+ca.nmds_yr0 <- metaMDS(year_0bc, k = 3, trymax = 100, trace = FALSE)
+
+nmds_scores_yr0 <- as.data.frame(scores(ca.nmds_yr0, display = "sites"))
+
+rownames_yr0 <- rownames(nmds_scores_yr0)
+
+nmds_scores_yr0 <- nmds_scores_yr0 %>%
+  mutate(
+    rowname_original = rownames_yr0,
+    trt = tolower(sub(" .*", "", rowname_original)),
+    water = as.character(water.levels[rowname_original, "water"])
+  ) %>%
+  mutate(
+    trt = factor(trt, levels = c("r", "dt", "fd", "ir")),
+    trt = recode_factor(trt,
+                        "r" = "Random",
+                        "dt" = "Drought Tolerant",
+                        "fd" = "Functionally Diverse",
+                        "ir" = "Invasion Resistant"),
+    water = factor(water, levels = water_levels, labels = water_labels)
+  )
+
+# integrity check: confirm every plot matched a treatment and water level (no rows silently dropped)
+cat("\n=== Data Check ===\n")
+print(paste("Total rows:", nrow(nmds_scores_yr0)))
+print(paste("Missing trt values:", sum(is.na(nmds_scores_yr0$trt))))
+print(paste("Missing water values:", sum(is.na(nmds_scores_yr0$water))))
+print(head(nmds_scores_yr0))
+
+nmds_scores_yr0 <- nmds_scores_yr0 %>% filter(!is.na(trt), !is.na(water))
+
+# distance matrix subset matching the filtered scores (used for betadisper and pairwise PERMANOVA)
+year_0bc_clean <- vegdist(as.matrix(year_0[rownames(nmds_scores_yr0), ]), method = "bray")
+
+adonis_trt_0 <- adonis2(year_0bc ~ trt, data = nmds_scores_yr0, permutations = 999)
+print(adonis_trt_0)
+adonis_h2o_0 <- adonis2(year_0bc ~ water, data = nmds_scores_yr0, permutations = 999)
+print(adonis_h2o_0)
+
+# --- PAIRWISE PERMANOVA: YEAR 0 ---
+cat("\n=== Year 0 Pairwise PERMANOVA: Treatment ===\n")
+pw_adonis_trt_0 <- pairwise.adonis(year_0bc_clean, nmds_scores_yr0$trt,
+                                   sim.method = "bray", p.adjust.m = "BH", perm = 999)
+print(pw_adonis_trt_0)
+
+cat("\n=== Year 0 Pairwise PERMANOVA: Precipitation ===\n")
+pw_adonis_h2o_0 <- pairwise.adonis(year_0bc_clean, nmds_scores_yr0$water,
+                                   sim.method = "bray", p.adjust.m = "BH", perm = 999)
+print(pw_adonis_h2o_0)
+```
+
+## Betadisper: Year 0
+
+```{r betadisper-year-0}
+# --- BETADISPER: YEAR 0 ---
+disp_trt_0 <- betadisper(year_0bc_clean, nmds_scores_yr0$trt)
+
+disp_h2o_0 <- betadisper(year_0bc_clean, nmds_scores_yr0$water)
+```
+
+## Figure 3A, 2019 NMDS by seed mix
+
+```{r plot-5-treatment-year0-14}
+p_trt_yr0 <- gg_ordiplot(ca.nmds_yr0, groups = nmds_scores_yr0$trt, ellipse = TRUE, plot = FALSE)$plot +
+  labs(color = "Seed Mixes", x = "NMDS1", y = "NMDS2",
+       title = paste0("2019 by Seed Mix (Stress = ", round(ca.nmds_yr0$stress, 3), ")")) +
+  scale_color_viridis_d(option = "viridis", begin = 0.2, end = 0.9) +
+  annotate("text", x = -Inf, y = Inf,
+           hjust = -0.05,
+           vjust = 1.2,
+           size = 6,
+           lineheight = 0.9,
+           label = paste0("PERMANOVA: R² = ", round(adonis_trt_0$R2[1], 3),
+                          "\n p = ", round(adonis_trt_0$`Pr(>F)`[1], 3)),
+           family = "Arial") +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  coord_fixed() +
+  theme_nmds() +
+  theme(aspect.ratio = 1,
+        panel.grid   = element_blank(),
+        plot.title   = element_text(size = 18, face = "bold", family = "Arial"),
+        axis.title   = element_text(size = 16, face = "bold", family = "Arial"),
+        axis.text    = element_text(size = 14, family = "Arial"),
+        legend.title = element_text(size = 16, face = "bold", family = "Arial"),
+        legend.text  = element_text(size = 16, family = "Arial"),
+        legend.key.width = unit(0.4, "cm"))
+
+print(p_trt_yr0)
+ggsave("A.5.18.26.png", plot = p_trt_yr0, width = 8, height = 6, dpi = 1200, units = "in", bg = "white")
+```
+
+## Figure 3C, 2019 NMDS by precipitation
+
+```{r plot-6-water-year0-15}
+p_water_yr0 <- gg_ordiplot(ca.nmds_yr0, groups = nmds_scores_yr0$water, ellipse = TRUE, plot = FALSE)$plot +
+  labs(color = "Precipitation", x = "NMDS1", y = "NMDS2",
+       title = paste0("2019 by Precipitation (Stress = ", round(ca.nmds_yr0$stress, 3), ")")) +
+  scale_color_viridis_d(option = "viridis", begin = 0.2, end = 0.6, labels = c("Addition", "Reduction")) +
+  annotate("text", x = -Inf, y = Inf,
+           hjust = -0.05,
+           vjust = 1.2,
+           size = 6,
+           lineheight = 0.9,
+           label = paste0("PERMANOVA: R² = ", round(adonis_h2o_0$R2[1], 3),
+                          "\n p = ", round(adonis_h2o_0$`Pr(>F)`[1], 3)),
+           family = "Arial") +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  coord_fixed() +
+  theme_nmds() +
+  theme(aspect.ratio = 1,
+        panel.grid   = element_blank(),
+        plot.title   = element_text(size = 18, face = "bold", family = "Arial"),
+        axis.title   = element_text(size = 16, face = "bold", family = "Arial"),
+        axis.text    = element_text(size = 14, family = "Arial"),
+        legend.title = element_text(size = 16, face = "bold", family = "Arial"),
+        legend.text  = element_text(size = 16, family = "Arial"),
+        legend.key.width = unit(0.4, "cm"))
+print(p_water_yr0)
+ggsave("B.5.18.26.png", plot = p_water_yr0, width = 8, height = 6, dpi = 1200, units = "in", bg = "white")
+```
+
+## analysis 6: NMDS year 4
+
+```{r analysis-6-nmds-year-4-16}
+year_4[is.na(year_4)] <- 0
+year_4bc <- vegdist(as.matrix(year_4), method = "bray")
+ca.nmds_yr4 <- metaMDS(year_4bc, k = 3, trymax = 100, trace = FALSE)
+
+nmds_scores_yr4 <- as.data.frame(scores(ca.nmds_yr4, display = "sites"))
+
+rownames_yr4 <- rownames(nmds_scores_yr4)
+
+nmds_scores_yr4 <- nmds_scores_yr4 %>%
+  mutate(
+    rowname_original = rownames_yr4,
+    trt = tolower(sub(" .*", "", rowname_original)),
+    water = as.character(water.levels[rowname_original, "water"])
+  ) %>%
+  mutate(
+    trt = factor(trt, levels = c("r", "dt", "fd", "ir")),
+    trt = recode_factor(trt,
+                        "r" = "Random",
+                        "dt" = "Drought Tolerant",
+                        "fd" = "Functionally Diverse",
+                        "ir" = "Invasion Resistant"),
+    water = factor(water, levels = water_levels, labels = water_labels)
+  )
+
+# integrity check: confirm every plot matched a treatment and water level (no rows silently dropped)
+cat("\n=== Year 4 Data Check ===\n")
+print(paste("Total rows:", nrow(nmds_scores_yr4)))
+print(paste("Missing trt values:", sum(is.na(nmds_scores_yr4$trt))))
+print(paste("Missing water values:", sum(is.na(nmds_scores_yr4$water))))
+print(head(nmds_scores_yr4))
+
+nmds_scores_yr4_clean <- nmds_scores_yr4 %>% filter(!is.na(trt), !is.na(water))
+
+# Distance matrix subset matching the filtered scores (used for betadisper and pairwise PERMANOVA)
+year_4bc_clean <- vegdist(as.matrix(year_4[rownames(nmds_scores_yr4_clean), ]), method = "bray")
+
+adonis_trt_4 <- adonis2(year_4bc ~ trt, data = nmds_scores_yr4_clean, permutations = 999)
+adonis_h2o_4 <- adonis2(year_4bc ~ water, data = nmds_scores_yr4_clean, permutations = 999)
+
+# --- PAIRWISE PERMANOVA: YEAR 4 ---
+cat("\n=== Year 4 Pairwise PERMANOVA: Treatment ===\n")
+pw_adonis_trt_4 <- pairwise.adonis(year_4bc_clean, nmds_scores_yr4_clean$trt,
+                                   sim.method = "bray", p.adjust.m = "BH", perm = 999)
+print(pw_adonis_trt_4)
+
+cat("\n=== Year 4 Pairwise PERMANOVA: Precipitation ===\n")
+pw_adonis_h2o_4 <- pairwise.adonis(year_4bc_clean, nmds_scores_yr4_clean$water,
+                                   sim.method = "bray", p.adjust.m = "BH", perm = 999)
+print(pw_adonis_h2o_4)
+```
+
+## Betadisper: Year 4
+
+```{r betadisper-year-4}
+# --- BETADISPER: YEAR 4 ---
+disp_trt_4 <- betadisper(year_4bc_clean, nmds_scores_yr4_clean$trt)
+
+disp_h2o_4 <- betadisper(year_4bc_clean, nmds_scores_yr4_clean$water)
+```
+
+### Figure 3B, 2023 NMDS by seed mix
+
+```{r plot-7-treatment-year4-19}
+  p_trt_yr4 <- gg_ordiplot(ca.nmds_yr4, groups = nmds_scores_yr4_clean$trt, ellipse = TRUE, plot = FALSE)$plot +
+  labs(color = "Seed Mixes", x = "NMDS1", y = "NMDS2",
+       title = paste0("2023 by Seed Mix (Stress = ", round(ca.nmds_yr4$stress, 3), ")")) +
+  scale_color_viridis_d(option = "viridis", begin = 0.2, end = 0.9) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1,
+           vjust = 1.2, size = 6, lineheight = 0.9,
+           label = paste0("PERMANOVA: R² = ", round(adonis_trt_4$R2[1], 3),
+                          "\n p = ", round(adonis_trt_4$`Pr(>F)`[1], 3)),
+           family = "Arial")+
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  coord_fixed() +
+  theme_nmds() +
+  theme(aspect.ratio = 1,
+        panel.grid   = element_blank(),
+        plot.title   = element_text(size = 18, face = "bold", family = "Arial"),
+        axis.title   = element_text(size = 16, face = "bold", family = "Arial"),
+        axis.text    = element_text(size = 14, family = "Arial"),
+        legend.title = element_text(size = 16, face = "bold", family = "Arial"),
+        legend.text  = element_text(size = 16, family = "Arial"),
+        legend.key.width = unit(0.4, "cm"))
+print(p_trt_yr4)
+ggsave("C.5.18.26.png", plot = p_trt_yr4, width = 8, height = 6, dpi = 1200, units = "in", bg = "white")
+```
+
+### Figure 3D, 2023 NMDS by precipitation
+
+```{r plot-8-water-year4-20}
+  p_water_yr4 <- gg_ordiplot(ca.nmds_yr4, groups = nmds_scores_yr4_clean$water, ellipse = TRUE, plot = FALSE)$plot +
+  labs(color = "Precipitation", x = "NMDS1", y = "NMDS2",
+       title = paste0("2023 by Precipitation (Stress = ", round(ca.nmds_yr4$stress, 3), ")")) +
+  scale_color_viridis_d(option = "viridis", begin = 0.2, end = 0.6, labels = c("Addition", "Reduction")) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1,
+           vjust = 1.2, size = 6, lineheight = 0.9,
+           label = paste0("PERMANOVA: R² = ", round(adonis_h2o_4$R2[1], 3),
+                          "\n p = ", round(adonis_h2o_4$`Pr(>F)`[1], 3)),
+           family = "Arial")+
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  coord_fixed() +
+  theme_nmds() +
+  theme(aspect.ratio = 1,
+        panel.grid   = element_blank(),
+        plot.title   = element_text(size = 18, face = "bold", family = "Arial"),
+        axis.title   = element_text(size = 16, face = "bold", family = "Arial"),
+        axis.text    = element_text(size = 14, family = "Arial"),
+        legend.title = element_text(size = 16, face = "bold", family = "Arial"),
+        legend.text  = element_text(size = 16, family = "Arial"),
+        legend.key.width = unit(0.4, "cm"))
+
+print(p_water_yr4)
+ggsave("D.5.18.26.png", plot = p_water_yr4, width = 8, height = 6, dpi = 1200, units = "in", bg = "white")
+
+# summary print out of permanovas, betadisper, pairwise permanova's 
+# --- CONSOLE SUMMARY PRINTOUTS ---
+cat("\n=== Year 0 Treatment PERMANOVA ===\n"); print(adonis_trt_0)
+cat("\n=== Year 0 Water PERMANOVA ===\n"); print(adonis_h2o_0)
+cat("\n=== Year 4 Treatment PERMANOVA ===\n"); print(adonis_trt_4)
+cat("\n=== Year 4 Water PERMANOVA ===\n"); print(adonis_h2o_4)
+
+cat("\n=== Year 0 Treatment BETADISPER ANOVA ===\n"); print(anova(disp_trt_0))
+cat("\n=== Year 0 Water BETADISPER ANOVA ===\n"); print(anova(disp_h2o_0))
+cat("\n=== Year 4 Treatment BETADISPER ANOVA ===\n"); print(anova(disp_trt_4))
+cat("\n=== Year 4 Water BETADISPER ANOVA ===\n"); print(anova(disp_h2o_4))
+
+cat("\n=== Year 0 Pairwise PERMANOVA: Treatment ===\n"); print(pw_adonis_trt_0)
+cat("\n=== Year 0 Pairwise PERMANOVA: Precipitation ===\n"); print(pw_adonis_h2o_0)
+cat("\n=== Year 4 Pairwise PERMANOVA: Treatment ===\n"); print(pw_adonis_trt_4)
+cat("\n=== Year 4 Pairwise PERMANOVA: Precipitation ===\n"); print(pw_adonis_h2o_4)
+print(betadisper(year_4bc_clean, nmds_scores_yr4_clean$water)$group.distances)
+```
+
+## Figure 3: NMDS ordinations (4 panels)
+
+```{r figure-3-nmds-4-panel}
+# Pull out each shared legend (left-justified) so both rows can reserve the SAME
+# width for the plot panels -> all four ordination boxes end up identical in size.
+leg_seedmix <- get_legend(p_trt_yr0   + theme(legend.justification = "left"))  # shared by A & B
+leg_precip  <- get_legend(p_water_yr0 + theme(legend.justification = "left"))  # shared by C & D
+
+# Top row: seed-mix ordinations (A = 2019, B = 2023) + shared legend on the right.
+row_AB <- ggarrange(
+  p_trt_yr0 + theme(legend.position = "none"),
+  p_trt_yr4 + theme(legend.position = "none"),
+  as_ggplot(leg_seedmix),
+  labels     = c("A", "B", ""),
+  label.y = 0.95,
+  ncol = 3, nrow = 1, widths = c(1, 1, 0.5),
+  font.label = list(size = 22, face = "bold", family = "Arial")
+)
+
+# Bottom row: precipitation ordinations (C = 2019, D = 2023) + shared legend on the right.
+row_CD <- ggarrange(
+  p_water_yr0 + theme(legend.position = "none"),
+  p_water_yr4 + theme(legend.position = "none"),
+  as_ggplot(leg_precip),
+  labels     = c("C", "D", ""),
+  label.y = 0.95,
+  ncol = 3, nrow = 1, widths = c(1, 1, 0.5),
+  font.label = list(size = 22, face = "bold", family = "Arial")
+)
+
+# Stack the two rows; identical width splits keep all four boxes the same size.
+figure_3 <- ggarrange(row_AB, row_CD, ncol = 1, nrow = 2)
+print(figure_3)
+ggsave("Figure_3.png", plot = figure_3, width = 14, height = 13, dpi = 1200, units = "in", bg = "white")
+```
+
+## analysis 7: shannon diversity and richness above and belowground
+
+```{r analysis-7-shannon-diversity-and-richness-above-and-belowground-21}
+# 1. Clean and match aboveground columns
+abvg_clean <- abvg_4 %>% dplyr::select(-1); rownames(abvg_clean) <- abvg_4[, 1]
+abvg_clean <- abvg_clean[, !colnames(abvg_clean) %in% c("BRDI", "BRHO", "BRMA", "FEMY", "FEPE", "HOMU", "POMO")]
+colnames(abvg_clean)[colnames(abvg_clean) == "LUMII"] <- "LUMI"
+colnames(abvg_clean)[colnames(abvg_clean) == "CACI"] <- "CAME"
+abvg_matched <- abvg_clean[, match(colnames(native.rel.rev), colnames(abvg_clean))]
+
+# drop empty rows to avoid NaN math warnings
+abvg_matched_clean <- abvg_matched[rowSums(abvg_matched, na.rm = TRUE) > 0, ]
+
+# 2. to handle spaces, dashes, or underscores
+calc_indices_robust <- function(matrix_data, type_label, water_df) {
+  
+  df_metrics <- data.frame(
+    shannon = diversity(matrix_data, index = "shannon"),
+    richness = specnumber(matrix_data)
+  ) %>%
+    rownames_to_column(var = "rowname") %>%
+    mutate(rowname_clean = gsub("[-_]", " ", rowname)) %>%
+    separate(rowname_clean, into = c("part1", "part2"), sep = "\\s+", fill = "right", remove = TRUE) %>%
+    mutate(
+      part1_upper = toupper(part1),
+      part2_upper = toupper(part2),
+      treatment = case_when(
+        part1_upper %in% c("R", "DT", "FD", "IR") ~ part1_upper,
+        part2_upper %in% c("R", "DT", "FD", "IR") ~ part2_upper,
+        TRUE ~ NA_character_
+      ),
+      plot = case_when(
+        grepl("^[0-9]+$", part1) ~ part1,
+        grepl("^[0-9]+$", part2) ~ part2,
+        TRUE ~ NA_character_
+      ),
+      type = type_label
+    ) %>%
+    dplyr::select(rowname, shannon, richness, treatment, plot, type)
+  
+  water_df_clean <- water_df %>%
+    mutate(
+      treatment = toupper(as.character(treatment)),
+      plot = as.character(plot)
+    )
+  
+  df_metrics %>%
+    left_join(water_df_clean, by = c("treatment", "plot"))
+}
+
+# 3. re-run index extractions
+df_above <- calc_indices_robust(decostand(abvg_matched_clean, "total"), "above", abvg_water)
+df_below <- calc_indices_robust(native.rel.rev, "below", abvg_water)
+
+# 4. make combined dataset and clean missing groups
+above_below <- bind_rows(df_above, df_below) %>%
+  mutate(
+    treatment = factor(treatment, levels = trt_levels),
+    type = factor(type, levels = c("above", "below")),
+    water = factor(water, levels = water_levels)
+  ) %>%
+  filter(!is.na(treatment), !is.na(water), !is.na(structure), !is.na(shannon))
+
+# 5. Three-Way Mixed-Effects Models (Type III ANOVA with Satterthwaite's method via lmerTest)
+shannon_model_full <- lmer(shannon ~ treatment * type * water + (1|structure), data = above_below)
+summary(shannon_model_full)
+anova(shannon_model_full)
+
+richness_model_full <- lmer(richness ~ treatment * type * water + (1|structure), data = above_below)
+summary(richness_model_full)
+print(anova(richness_model_full))
+
+letters_shannon <- get_cld_letters(shannon_model_full, above_below, "shannon")
+letters_richness <- get_cld_letters(richness_model_full, above_below, "richness")
+```
+
+## Figure S4, above/belowground Shannon diversity
+
+```{r plot-9-above-and-below-shannon-boxplot-22}
+above_below_shannon_boxplot <- ggplot(above_below, aes(y = shannon, x = treatment, fill = interaction(type, water))) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "darkred",
+               position = position_dodge(width = 0.75), aes(group = interaction(type, water))) +
+  geom_text(data = letters_shannon, aes(y = yposition, label = Letters, group = interaction(type, water)),
+            position = position_dodge(width = 0.75), vjust = 0, size = 6.5, show.legend = FALSE, family = "Arial") +
+  scale_x_discrete(labels = trt_labels) +
+  scale_fill_viridis_d(option = "viridis", begin = 0.2, end = 0.9, name = "",
+                       labels = c("above.125" = "Aboveground - Precip Addition", "above.50" = "Aboveground - Precip Reduction",
+                                  "below.125" = "Belowground - Precip Addition", "below.50" = "Belowground - Precip Reduction")) +
+  scale_y_continuous(expand = expansion(mult = c(0.07, 0.15))) +
+  labs(x = NULL, y = "Native Shannon Diversity") +
+  theme_custom() +
+  theme(
+    panel.grid      = element_blank(),                                  # remove background grid
+    axis.line       = element_line(colour = "black", linewidth = 0.8),  # solid axis lines
+    axis.ticks      = element_line(colour = "black", linewidth = 0.8),
+    legend.text     = element_text(size = 20, family = "Arial"),
+    legend.title    = element_text(size = 20, family = "Arial"),
+    legend.key.size = unit(1.2, "cm"),
+    axis.title.y    = element_text(size = 20, face = "bold", family = "Arial"),
+    axis.text.x     = element_text(size = 20, family = "Arial"),
+    axis.text.y     = element_text(size = 20, family = "Arial")
+  ) +
+  # stack the 4 legend entries into two rows at the bottom
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+print(above_below_shannon_boxplot)
+ggsave("Figure_S4.png", plot = above_below_shannon_boxplot, width = 12, height = 6, dpi = 1200, units = "in", bg = "white")
+```
+
+## Figure S3, above/belowground richness
+
+```{r plot-10-above-and-below-richness-boxplot-23}
+above_below_richness_boxplot <- ggplot(above_below, aes(y = richness, x = treatment, fill = interaction(type, water))) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "darkred",
+               position = position_dodge(width = 0.75), aes(group = interaction(type, water))) +
+  geom_text(data = letters_richness, aes(y = yposition, label = Letters, group = interaction(type, water)),
+            position = position_dodge(width = 0.75), vjust = 0, size = 6.5, show.legend = FALSE, family = "Arial") +
+  scale_x_discrete(labels = trt_labels) +
+  scale_fill_viridis_d(option = "viridis", begin = 0.2, end = 0.9, name = "",
+                       labels = c("above.125" = "Aboveground - Precip Addition", "above.50" = "Aboveground - Precip Reduction",
+                                  "below.125" = "Belowground - Precip Addition", "below.50" = "Belowground - Precip Reduction")) +
+  scale_y_continuous(expand = expansion(mult = c(0.07, 0.15))) +
+  labs(x = NULL, y = "Native Species Richness") +
+  theme_custom() +
+  theme(
+    panel.grid      = element_blank(),                                  # remove background grid
+    axis.line       = element_line(colour = "black", linewidth = 0.8),  # solid axis lines
+    axis.ticks      = element_line(colour = "black", linewidth = 0.8),
+    legend.text     = element_text(size = 20, family = "Arial"),
+    legend.title    = element_text(size = 20, family = "Arial"),
+    legend.key.size = unit(1.2, "cm"),
+    axis.title.y    = element_text(size = 20, face = "bold", family = "Arial"),
+    axis.text.x     = element_text(size = 20, family = "Arial"),
+    axis.text.y     = element_text(size = 20, family = "Arial")
+  ) +
+  # stack the 4 legend entries into two rows at the bottom
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+print(above_below_richness_boxplot)
+ggsave("Figure_S3.png", plot = above_below_richness_boxplot, width = 12, height = 6, dpi = 1200, units = "in", bg = "white")
+```
+
+## analysis 8: species abundance comparisons
+
+```{r analysis-8-species-abundance-comparisons-24}
+cat("\n=== Year 0 Data ===\n")
+print(head(year_0))
+print(paste("Dimensions:", nrow(year_0), "x", ncol(year_0)))
+
+cat("\n=== Year 4 Data ===\n")
+print(head(year_4))
+print(paste("Dimensions:", nrow(year_4), "x", ncol(year_4)))
+
+# calculate means before converting to full names
+species_means_yr0 <- data.frame(
+  code = names(colMeans(year_0, na.rm = TRUE)),
+  mean_abundance = colMeans(year_0, na.rm = TRUE),
+  row.names = NULL
+)
+
+species_means_yr4 <- data.frame(
+  code = names(colMeans(year_4, na.rm = TRUE)),
+  mean_abundance = colMeans(year_4, na.rm = TRUE),
+  row.names = NULL
+)
+
+cat("\n=== Species Means Year 0 ===\n")
+print(head(species_means_yr0))
+
+cat("\n=== Species Means Year 4 ===\n")
+print(head(species_means_yr4))
+
+# create a species lookup table
+species_lookup <- data.frame(
+  code = c("FEMI", "PHCI", "BRCA", "AMME", "ACAM", "GRCA", "CAME", "CIOC",
+           "ACST", "SPAI", "KOMA", "ACMI", "ESCA", "LUSU", "MURI", "ELGL",
+           "SIBE", "LUBI", "DEFA", "MEIM", "LUMI", "HOIN", "STPU", "ASFA",
+           "POSE", "ARPU", "LAPL", "RACA", "PLER", "TRWI", "HOBR", "ELCO"),
+  species_name = c(
+    "F. microstachys", "P. cicutaria", "B. carinatus", "A. menziesii",
+    "A. americanus", "G. camporum", "C. menziesii", "C. occidentale",
+    "A. strigosus", "S. airoides", "K. macrantha", "A. millefolium",
+    "E. californica", "L. succulentus", "M. rigens", "E. glaucus",
+    "S. bellum", "L. bicolor", "D. fasciculata", "M. imperfecta",
+    "L. microcarpus", "H. intercedens", "S. pulchra", "A. fascicularis",
+    "P. secunda", "A. purpurea", "L. platyglossa", "R. californicus",
+    "P. erecta", "T. willdenovii", "H. brachyantherum", "E. condensatus"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# join with lookup table
+species_means_yr0 <- species_means_yr0 %>%
+  left_join(species_lookup, by = "code") %>%
+  dplyr::select(code, species_name, mean_abundance) %>%
+  mutate(species_name = ifelse(is.na(species_name), code, species_name)) %>%
+  dplyr::select(species_name, mean_abundance) %>%
+  rename(species = species_name)
+
+species_means_yr4 <- species_means_yr4 %>%
+  left_join(species_lookup, by = "code") %>%
+  dplyr::select(code, species_name, mean_abundance) %>%
+  mutate(species_name = ifelse(is.na(species_name), code, species_name)) %>%
+  dplyr::select(species_name, mean_abundance) %>%
+  rename(species = species_name)
+
+cat("\n=== After Name Conversion - Yr0 ===\n")
+print(head(species_means_yr0))
+
+cat("\n=== After Name Conversion - Yr4 ===\n")
+print(head(species_means_yr4))
+
+# define order
+species_order_years <- bind_rows(species_means_yr0, species_means_yr4) %>%
+  group_by(species) %>%
+  summarise(overall_mean = mean(mean_abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(overall_mean)) %>%
+  pull(species)
+
+species_means_yr0$species <- factor(species_means_yr0$species, levels = species_order_years)
+species_means_yr4$species <- factor(species_means_yr4$species, levels = species_order_years)
+
+y_range_years <- range(c(species_means_yr0$mean_abundance, species_means_yr4$mean_abundance), na.rm = TRUE)
+```
+
+## Figure 4, species means 2019 (top panel)
+
+```{r plot-11-species-means-year-0-25}
+p_year0_bars <- ggplot(species_means_yr0, aes(x = species, y = mean_abundance, fill = species)) +
+  geom_col(show.legend = FALSE) +
+  ylim(y_range_years) +
+  labs(x = NULL, y = NULL) +
+  scale_fill_manual(values = rep(viridisLite::viridis(1, begin = 0.2), length(unique(species_means_yr0$species)))) +
+  scale_x_discrete(labels = setNames(species_lookup$code, species_lookup$species_name)) +  # show 4-letter codes
+  annotate("text", x = Inf, y = Inf, label = "2019", hjust = 1.3, vjust = 1.8,
+           size = 7, fontface = "bold", family = "Arial") +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    panel.grid  = element_blank(),                                  # remove gridlines
+    axis.line   = element_line(colour = "black", linewidth = 0.6),  # solid axis lines
+    axis.ticks  = element_line(colour = "black", linewidth = 0.6),
+    axis.text.x = element_text(angle = 55, vjust = 1, hjust = 1, size = 14, face = "bold", family = "Arial"),
+    axis.text.y = element_text(size = 14, family = "Arial"),
+    plot.title  = element_text(size = 16, face = "bold", family = "Arial", hjust = 0.5),
+    plot.margin = margin(t = 5, r = 5, b = 22, l = 5)  # extra bottom room so angled codes aren't clipped
+  )
+
+print(p_year0_bars)
+```
+
+## Figure 4, species means 2023 (bottom panel + combine)
+
+```{r plot-12-species-means-year-4-26}
+p_year4_bars <- ggplot(species_means_yr4, aes(x = species, y = mean_abundance, fill = species)) +
+  geom_col(show.legend = FALSE) +
+  ylim(y_range_years) +
+  labs(x = NULL, y = NULL) +
+  scale_fill_manual(values = rep(viridisLite::viridis(1, begin = 0.2), length(unique(species_means_yr0$species)))) +
+  scale_x_discrete(labels = setNames(species_lookup$code, species_lookup$species_name)) +  # show 4-letter codes
+  annotate("text", x = Inf, y = Inf, label = "2023", hjust = 1.3, vjust = 1.8,
+           size = 7, fontface = "bold", family = "Arial") +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    panel.grid  = element_blank(),                                  # remove gridlines
+    axis.line   = element_line(colour = "black", linewidth = 0.6),  # solid axis lines
+    axis.ticks  = element_line(colour = "black", linewidth = 0.6),
+    axis.text.x = element_text(angle = 55, vjust = 1, hjust = 1, size = 14, face = "bold", family = "Arial"),
+    axis.text.y = element_text(size = 14, family = "Arial"),
+    plot.title  = element_text(size = 16, face = "bold", family = "Arial", hjust = 0.5),
+    plot.margin = margin(t = 5, r = 5, b = 22, l = 5)  # extra bottom room so angled codes aren't clipped
+  )
+
+print(p_year4_bars)
+
+# Top 10 species by year
+top_yr0 <- species_means_yr0 %>% arrange(desc(mean_abundance)) %>% head(10)
+top_yr4 <- species_means_yr4 %>% arrange(desc(mean_abundance)) %>% head(10)
+
+print(top_yr0)
+print(top_yr4)
+
+year_comparison_figure <- suppressWarnings(ggarrange(p_year0_bars, p_year4_bars,
+                                                     ncol = 1, nrow = 2)) %>%
+  annotate_figure(bottom = text_grob("Species", size = 18, face = "bold", family = "Arial"),
+                  left = text_grob("Relative Abundance", size = 18, face = "bold", family = "Arial", rot = 90))
+print(year_comparison_figure)
+
+ggsave("Figure_4.png", plot = year_comparison_figure, width = 12, height = 10, dpi = 1200, units = "in", bg = "white")
+
+## above & belowground comparison figure:
+abvg_matched_clean <- abvg_matched[rowSums(abvg_matched, na.rm = TRUE) > 0, ]
+abvg_4_rel <- decostand(abvg_matched_clean, method = "total")
+
+species_means_abvg <- data.frame(
+  code = names(colMeans(abvg_4_rel, na.rm = TRUE)),
+  mean_abundance = colMeans(abvg_4_rel, na.rm = TRUE),
+  row.names = NULL
+) %>%
+  left_join(species_lookup, by = "code") %>%
+  mutate(species_name = ifelse(is.na(species_name), code, species_name)) %>%
+  dplyr::select(species_name, mean_abundance) %>%
+  rename(species = species_name)
+
+species_means_blwg <- data.frame(
+  code = names(colMeans(year_4, na.rm = TRUE)),
+  mean_abundance = colMeans(year_4, na.rm = TRUE),
+  row.names = NULL
+) %>%
+  left_join(species_lookup, by = "code") %>%
+  mutate(species_name = ifelse(is.na(species_name), code, species_name)) %>%
+  dplyr::select(species_name, mean_abundance) %>%
+  rename(species = species_name)
+
+# find shared species
+shared_species <- intersect(
+  as.character(species_means_abvg$species),
+  as.character(species_means_blwg$species)
+)
+
+# determine global ordering based on shared species
+species_order_loc <- bind_rows(species_means_abvg, species_means_blwg) %>%
+  filter(species %in% shared_species) %>%
+  group_by(species) %>%
+  summarise(overall_mean = mean(mean_abundance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(overall_mean)) %>%
+  pull(species)
+
+# filter datasets down to shared species before factoring
+species_means_abvg <- species_means_abvg %>% filter(species %in% shared_species)
+species_means_blwg <- species_means_blwg %>% filter(species %in% shared_species)
+
+# apply factors 
+species_means_abvg$species <- factor(species_means_abvg$species, levels = species_order_loc)
+species_means_blwg$species <- factor(species_means_blwg$species, levels = species_order_loc)
+
+y_range_loc <- range(c(species_means_abvg$mean_abundance, species_means_blwg$mean_abundance), na.rm = TRUE)
+```
+
+## Figure S5, species means aboveground (top panel)
+
+```{r plot-13-species-means-aboveground-27}
+p_above_bars <- ggplot(species_means_abvg, aes(x = species, y = mean_abundance, fill = species)) +
+  geom_col(show.legend = FALSE) +
+  ylim(y_range_loc) +
+  labs(x = NULL, y = NULL) +
+  scale_fill_manual(values = rep(viridisLite::viridis(1, begin = 0.2), length(unique(species_means_abvg$species)))) +
+  scale_x_discrete(labels = setNames(species_lookup$code, species_lookup$species_name)) +  # show 4-letter codes
+  annotate("text", x = Inf, y = Inf, label = "Aboveground", hjust = 1.1, vjust = 1.8,
+           size = 7, fontface = "bold", family = "Arial") +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    panel.grid  = element_blank(),                                  # remove gridlines
+    axis.line   = element_line(colour = "black", linewidth = 0.6),  # solid axis lines
+    axis.ticks  = element_line(colour = "black", linewidth = 0.6),
+    axis.text.x = element_text(angle = 55, vjust = 1, hjust = 1, size = 14, face = "bold", family = "Arial"),
+    axis.text.y = element_text(size = 14, family = "Arial"),
+    plot.title  = element_text(size = 16, face = "bold", family = "Arial", hjust = 0.5),
+    plot.margin = margin(t = 5, r = 5, b = 22, l = 5)  # extra bottom room so angled codes aren't clipped
+  )
+```
+
+## Figure S5, species means belowground (bottom panel + combine)
+
+```{r plot-14-species-means-belowground-28}
+p_below_bars <- ggplot(species_means_blwg, aes(x = species, y = mean_abundance, fill = species)) +
+  geom_col(show.legend = FALSE) +
+  ylim(y_range_loc) +
+  labs(x = NULL, y = NULL) +
+  scale_fill_manual(values = rep(viridisLite::viridis(1, begin = 0.2), length(unique(species_means_blwg$species)))) +
+  scale_x_discrete(labels = setNames(species_lookup$code, species_lookup$species_name)) +  # show 4-letter codes
+  annotate("text", x = Inf, y = Inf, label = "Belowground", hjust = 1.1, vjust = 1.8,
+           size = 7, fontface = "bold", family = "Arial") +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    panel.grid  = element_blank(),                                  # remove gridlines
+    axis.line   = element_line(colour = "black", linewidth = 0.6),  # solid axis lines
+    axis.ticks  = element_line(colour = "black", linewidth = 0.6),
+    axis.text.x = element_text(angle = 55, vjust = 1, hjust = 1, size = 14, face = "bold", family = "Arial"),
+    axis.text.y = element_text(size = 14, family = "Arial"),
+    plot.title  = element_text(size = 16, face = "bold", family = "Arial", hjust = 0.5),
+    plot.margin = margin(t = 5, r = 5, b = 22, l = 5)  # extra bottom room so angled codes aren't clipped
+  )
+
+location_comparison_figure <- ggarrange(p_above_bars, p_below_bars,
+                                        ncol = 1, nrow = 2) %>%
+  annotate_figure(bottom = text_grob("Species", size = 18, face = "bold", family = "Arial"),
+                  left = text_grob("Relative Abundance", size = 18, face = "bold", family = "Arial", rot = 90))
+
+print(location_comparison_figure)
+ggsave("Figure_S5.png", plot = location_comparison_figure, width = 12, height = 10, dpi = 1200, units = "in", bg = "white")
+```
+
+### analysis 9: coupling matrix analysis (permanova and betadisper)
+
+```{r analysis-9-coupling-matrix-analysis-permanova-and-betadisper-29}
+abvg_4_rel <- decostand(abvg_matched_clean, method = "total")
+year_4_rel <- decostand(native_mat.rev7, method = "total")
+
+# function to standardize row names so they match perfectly
+standardize_rownames <- function(mat) {
+  rn <- rownames(mat)
+  rn <- tolower(gsub("[-_]", " ", rn))
+  rn <- gsub("^([0-9]+)\\s+([a-z]+)$", "\\2 \\1", rn)
+  rownames(mat) <- rn
+  return(mat)
+}
+
+# apply the fix to both matrices
+abvg_4_rel <- standardize_rownames(abvg_4_rel)
+year_4_rel <- standardize_rownames(year_4_rel)
+
+# row matching fix
+common_plots <- intersect(rownames(abvg_4_rel), rownames(year_4_rel))
+
+abvg_4_rel <- abvg_4_rel[common_plots, ]
+year_4_rel <- year_4_rel[common_plots, ]
+
+allcomms9 <- bind_rows(
+  as.data.frame(abvg_4_rel),
+  as.data.frame(year_4_rel)
+)
+allcomms9[is.na(allcomms9)] <- 0
+
+allcomms9$dummy_spp <- 0.0001
+
+n_plots <- nrow(abvg_4_rel)
+rownames(allcomms9) <- c(
+  paste0(rownames(abvg_4_rel), "_above"),
+  paste0(rownames(year_4_rel), "_below")
+)
+
+bcdist_comm_raw9 <- vegdist(as.matrix(allcomms9), method = "bray")
+bcdist_matrix_raw9 <- as.matrix(bcdist_comm_raw9)
+
+bcdist_comm_subset <- bcdist_matrix_raw9[1:n_plots, (n_plots + 1):(2 * n_plots)]
+coupling_dissimilarity <- data.frame(
+  id = rownames(abvg_4_rel),
+  dist.ca = diag(bcdist_comm_subset)
+)
+
+coupling_dissimilarity$trt <- sub(" .*", "", coupling_dissimilarity$id)
+
+coupling_dissimilarity <- coupling_dissimilarity %>%
+  separate(id, into = c("treatment", "plot_num"), sep = " ", remove = FALSE) %>%
+  mutate(treatment = toupper(treatment)) %>%
+  left_join(abvg_water %>% mutate(plot = as.character(plot), treatment = toupper(treatment)),
+            by = c("treatment", "plot_num" = "plot")) %>%
+  dplyr::select(id, dist.ca, trt = treatment, water)
+
+set.seed(123)
+ca.nmds_coupling <- metaMDS(bcdist_comm_raw9, distance = "bray", k = 2, trymax = 100)
+
+nmds_scores_coupling <- as.data.frame(scores(ca.nmds_coupling, display = "sites"))
+nmds_scores_coupling$type <- factor(rep(c("Above", "Below"), each = n_plots),
+                                    levels = c("Above", "Below"))
+
+cat("\n=== PERMANOVA: COMMUNITY TYPE ===\n")
+adonis_type <- adonis2(bcdist_comm_raw9 ~ type, data = nmds_scores_coupling, permutations = 999)
+print(adonis_type)
+
+cat("\n=== Pairwise PERMANOVA: Community Type (Above vs Below) ===\n")
+pw_adonis_type <- pairwise.adonis(bcdist_comm_raw9, nmds_scores_coupling$type,
+                                  sim.method = "bray", p.adjust.m = "BH", perm = 999)
+print(pw_adonis_type)
+
+cat("\n=== BETADISPER: COMMUNITY TYPE ===\n")
+disper_type <- betadisper(bcdist_comm_raw9, group = nmds_scores_coupling$type)
+print(disper_type)
+
+cat("\n--- ANOVA of Betadisper (Are dispersions significantly different?) ---\n")
+print(anova(disper_type))
+
+# extracting values for plot annotation
+r2_type <- round(adonis_type$R2[1], 3)
+p_type  <- adonis_type$`Pr(>F)`[1]
+```
+
+## Figure 5, above- vs belowground NMDS
+
+```{r plot-15-above-and-below-nmds-plot-30}
+coupling_plot <- gg_ordiplot(ca.nmds_coupling, groups = nmds_scores_coupling$type,
+                             ellipse = TRUE, plot = FALSE)
+
+final_coupling_plot <- coupling_plot$plot +
+  labs(
+    color = "Community Type",
+    x = "NMDS1",
+    y = "NMDS2",
+    title = paste0("2023 Above vs Belowground (Stress = ", round(ca.nmds_coupling$stress, 3), ")")
+  ) +
+  scale_color_viridis_d(option = "viridis", begin = 0.2, end = 0.6,
+                        labels = c("Aboveground", "Belowground")) +
+  annotate("text", x = -Inf, y = Inf,
+           label = paste0("PERMANOVA:\nR² = ", r2_type, ", p = ", p_type),
+           hjust = -0.1, vjust = 1.2, size = 4.5, family = "Arial") +
+  theme_nmds() +
+  theme(
+    panel.grid   = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+    plot.margin  = margin(t = 10, r = 10, b = 35, l = 35),
+    plot.title   = element_text(size = 14, face = "bold", family = "Arial"),
+    axis.title   = element_text(size = 16, face = "bold", family = "Arial"),
+    axis.text    = element_text(size = 14, family = "Arial"),
+    legend.title = element_text(size = 16, face = "bold", family = "Arial"),
+    legend.text  = element_text(size = 14, family = "Arial"),
+    legend.key.width = unit(0.4, "cm")
+  ) +
+  coord_cartesian(clip = "off")
+
+print(final_coupling_plot)
+ggsave("Figure_5.png", plot = final_coupling_plot, width = 8, height = 6, dpi = 1200, units = "in", bg = "white")
+```
+
+### analysis 10: contrasts
+
+```{r analysis-10-contrasts-31}
+invasive <- apply_factors(invasive)
+model_fp <- glmer.nb(total_invasive ~ treatment * water + (1|structure), data = invasive)
+
+emm_fp <- emmeans(model_fp, ~ water | treatment)
+contrasts_fp <- contrast(emm_fp, method = "revpairwise", by = "treatment")
+contrast_summary <- summary(contrasts_fp, infer = TRUE)
+```
+
+### Figure S2, forest plot (precipitation effect)
+
+```{r plot-16-forest-plot-32, fig.width = 9, fig.height = 4}
+  forest_data <- as.data.frame(contrast_summary) %>%
+  mutate(
+    ci95_lower = asymp.LCL,
+    ci95_upper = asymp.UCL,
+    ci50_lower = estimate - 0.674 * SE,
+    ci50_upper = estimate + 0.674 * SE,
+    treatment = factor(treatment, levels = trt_levels)
+  )
+
+forest_plot <- ggplot(forest_data, aes(x = estimate, y = treatment, color = treatment)) +
+  geom_errorbarh(aes(xmin = ci95_lower, xmax = ci95_upper), height = 0, linewidth = 0.5) +
+  geom_errorbarh(aes(xmin = ci50_lower, xmax = ci50_upper), height = 0, linewidth = 1.5) +
+  geom_point(size = 4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_viridis_d(option = "viridis", begin = 0.2, end = 0.9) +
+  scale_y_discrete(labels = trt_labels) +
+  labs(x = "Effect of precipitation on invasive seed counts\n(Addition - Reduction)", y = NULL) +
+  theme_classic(base_family = "Arial") +
+  theme(
+    axis.text.y = element_text(size = 16, family = "Arial"),
+    axis.text.x = element_text(size = 14, family = "Arial"),
+    axis.title  = element_text(size = 18, face = "bold", family = "Arial"),
+    legend.position = "none"
+  )
+
+print(forest_plot)
+ggsave("Figure_S2.png", plot = forest_plot, width = 9, height = 4, dpi = 1200, units = "in", bg = "white")
+```
+
+## analysis 11: seed mass correlation
+
+```{r analysis-11-seed-mass-correlation-33}
+abundance_mass <- lm(mean_abundance ~ seed.mass, data = seed_data)
+print(summary(abundance_mass))
+print(anova(abundance_mass))
+```
+
